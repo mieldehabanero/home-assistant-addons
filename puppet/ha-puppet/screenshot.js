@@ -715,11 +715,22 @@ export class Browser {
         sharpInstance = sharpInstance.webp();
         image = await sharpInstance.toBuffer();
       } else if (format === "png" && pngMode === "grayscale") {
-        sharpInstance = sharpInstance
+        const { data, info } = await sharpInstance
           .removeAlpha()
           .toColourspace("b-w")
-          .png({ colours: 16, palette: false, progressive: false });
-        image = await sharpInstance.toBuffer();
+          .raw()
+          .toBuffer({ resolveWithObject: true });
+        // libpng packs the low four bits without scaling. Round to gray levels
+        // whose high and low nibbles both represent the intended 4-bit value.
+        for (let offset = 0; offset < data.length; offset++) {
+          data[offset] = Math.round(data[offset] / 17) * 17;
+        }
+        image = await sharp(data, {
+          raw: { width: info.width, height: info.height, channels: info.channels },
+        })
+          .toColourspace("b-w")
+          .png({ colours: 16, palette: false, progressive: false })
+          .toBuffer();
       } else if (format === "bmp") {
         // Support multiple BMP modes: color (24-bit), grayscale (8-bit), binary (1-bit)
         if (bmpMode === "grayscale") {
