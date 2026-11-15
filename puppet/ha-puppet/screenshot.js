@@ -1,6 +1,7 @@
 import puppeteer from "puppeteer";
 import sharp from "sharp"; // Import sharp
 import { BMPEncoder } from "./bmp.js";
+import { encodeGrayscalePng4 } from "./png.js";
 import { debug, isAddOn, chromiumExecutable } from "./const.js";
 import { CannotOpenPageError } from "./error.js";
 
@@ -617,7 +618,7 @@ export class Browser {
     }
   }
 
-  async screenshotPage({ viewport, colors, paletteColors, dithering, invert, zoom, format, rotate, autoHeight = false, bmpMode = "color" }) {
+  async screenshotPage({ viewport, colors, paletteColors, dithering, invert, zoom, format, rotate, autoHeight = false, pngMode = "color", bmpMode = "color" }) {
     let start = new Date();
     if (this.busy) {
       throw new Error("Browser is busy");
@@ -661,6 +662,7 @@ export class Browser {
       // processing is requested we can skip the sharp decode/re-encode.
       if (
         format === "png" &&
+        pngMode === "color" &&
         !rotate &&
         !invert &&
         !(colors && colors.length > 0)
@@ -713,6 +715,14 @@ export class Browser {
       } else if (format === "webp") {
         sharpInstance = sharpInstance.webp();
         image = await sharpInstance.toBuffer();
+      } else if (format === "png" && pngMode === "grayscale") {
+        const { data, info } = await sharpInstance
+          .removeAlpha()
+          .toColourspace("b-w")
+          .raw()
+          .toBuffer({ resolveWithObject: true });
+        // libvips 8.17.2 mispacks the last pixel of odd-width 4-bit PNG rows.
+        image = encodeGrayscalePng4(data, info.width, info.height);
       } else if (format === "bmp") {
         // Support multiple BMP modes: color (24-bit), grayscale (8-bit), binary (1-bit)
         if (bmpMode === "grayscale") {

@@ -250,6 +250,11 @@ class RequestHandler {
         format = "png";
       }
 
+      let pngMode = requestUrl.searchParams.get("png_mode") || "color";
+      if (!["color", "grayscale"].includes(pngMode)) {
+        pngMode = "color";
+      }
+
       // BMP mode: 'color' (24-bit), 'grayscale' (8-bit), 'binary' (1-bit)
       let bmpMode = requestUrl.searchParams.get("bmp_mode") || "color";
       if (!["color", "grayscale", "binary"].includes(bmpMode)) {
@@ -295,6 +300,7 @@ class RequestHandler {
         autoHeight,
         zoom,
         format,
+        pngMode,
         bmpMode,
         rotate,
         lang,
