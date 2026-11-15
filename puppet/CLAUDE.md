@@ -97,7 +97,7 @@ Manages Puppeteer browser instance and screenshot generation.
   - Rotation (90°, 180°, 270°)
   - Palette reduction with optional error-diffusion dithering (`colors`, `palette_colors`, `dithering`)
   - Color inversion
-  - Format conversion (PNG, JPEG, WebP, BMP — BMP as 24-bit color, 8-bit grayscale, or 1-bit binary via `bmp_mode`)
+  - Format conversion (PNG as color or 4-bit grayscale via `png_mode`, JPEG, WebP, BMP — BMP as 24-bit color, 8-bit grayscale, or 1-bit binary via `bmp_mode`)
 - Returns image buffer
 
 ### 3. Web UI (`ui.js`)
@@ -129,6 +129,7 @@ Manages Puppeteer browser instance and screenshot generation.
 | width | number | Viewport width (100-4000px) | 1000 |
 | height | number/`auto` | Viewport height (100-4000px), or `auto` for full page height | 1000 |
 | format | string | Output format (png, jpeg, webp, bmp) | `png` |
+| png_mode | string | PNG encoding (color, grayscale — 4-bit, 16 shades) | `color` |
 | bmp_mode | string | BMP encoding (color, grayscale, binary) | `color` |
 | theme | string | HA theme name | (empty) |
 | dark | boolean | Enable dark mode | false |
@@ -267,6 +268,7 @@ Returns screenshot of Home Assistant page
 - `viewport={width}x{height}` (required unless `device` given; height may be `auto`; dimensions clamped to 10-4000)
 - `device={name}` (optional, preset from devices.json supplying viewport/colors/palette_colors/dithering defaults)
 - `format={png|jpeg|webp|bmp}` (optional, default: png)
+- `png_mode={color|grayscale}` (optional, default: color; grayscale returns a true 4-bit grayscale PNG with sixteen shades and no alpha)
 - `bmp_mode={color|grayscale|binary}` (optional, default: color)
 - `theme={theme_name}` (optional)
 - `dark` (optional, flag)

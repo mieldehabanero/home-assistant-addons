@@ -113,6 +113,24 @@ http://homeassistant.local:10000/home?viewport=1000x1000&format=webp
 http://homeassistant.local:10000/home?viewport=1000x1000&format=bmp
 ```
 
+For a smaller grayscale image, select **PNG** as the format and
+**Grayscale (4-bit)** under **PNG Mode**, or use `png_mode=grayscale`:
+
+```
+http://homeassistant.local:10000/home?viewport=1200x825&png_mode=grayscale
+```
+
+![PNG Mode set to Grayscale (4-bit)](example/png-mode.png)
+
+This converts the screenshot to a true 4-bit grayscale PNG without transparency,
+using sixteen evenly spaced shades from black to white (`000000`, `111111`,
+through `FFFFFF`). Existing palette, dithering, rotation, and inversion settings
+are applied before encoding. A custom output palette with other colors or gray
+values will be converted to these sixteen shades. The response remains
+`image/png`; the number of shades shown on the display depends on its firmware.
+The default PNG mode is **Color** (`png_mode=color`). This setting only applies
+when the format is PNG.
+
 ### Rotate screenshot
 
 You can rotate the screenshot by adding the `rotate` query parameter. Valid values are 90, 180, and 270.

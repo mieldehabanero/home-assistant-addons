@@ -617,7 +617,7 @@ export class Browser {
     }
   }
 
-  async screenshotPage({ viewport, colors, paletteColors, dithering, invert, zoom, format, rotate, autoHeight = false, bmpMode = "color" }) {
+  async screenshotPage({ viewport, colors, paletteColors, dithering, invert, zoom, format, rotate, autoHeight = false, pngMode = "color", bmpMode = "color" }) {
     let start = new Date();
     if (this.busy) {
       throw new Error("Browser is busy");
@@ -661,6 +661,7 @@ export class Browser {
       // processing is requested we can skip the sharp decode/re-encode.
       if (
         format === "png" &&
+        pngMode === "color" &&
         !rotate &&
         !invert &&
         !(colors && colors.length > 0)
@@ -712,6 +713,12 @@ export class Browser {
         image = await sharpInstance.toBuffer();
       } else if (format === "webp") {
         sharpInstance = sharpInstance.webp();
+        image = await sharpInstance.toBuffer();
+      } else if (format === "png" && pngMode === "grayscale") {
+        sharpInstance = sharpInstance
+          .removeAlpha()
+          .toColourspace("b-w")
+          .png({ colours: 16, palette: false, progressive: false });
         image = await sharpInstance.toBuffer();
       } else if (format === "bmp") {
         // Support multiple BMP modes: color (24-bit), grayscale (8-bit), binary (1-bit)
