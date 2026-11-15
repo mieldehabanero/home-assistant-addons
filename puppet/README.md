@@ -120,6 +120,8 @@ For a smaller grayscale image, select **PNG** as the format and
 http://homeassistant.local:10000/home?viewport=1200x825&png_mode=grayscale
 ```
 
+![PNG Mode set to Grayscale (4-bit)](example/png-mode.png)
+
 This converts the screenshot to a true 4-bit grayscale PNG without transparency,
 using sixteen evenly spaced shades from black to white (`000000`, `111111`,
 through `FFFFFF`). Existing palette, dithering, rotation, and inversion settings
