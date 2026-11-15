@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.6.4
+
+### Grayscale PNG output
+
+- Add a PNG Mode setting with Color and Grayscale (4-bit) options for smaller images with sixteen gray levels.
+- Upgrade Sharp to 0.35.5 for correct encoding of odd-width grayscale PNG images.
+
 ## 2.6.3
 
 ### Bug fixes
