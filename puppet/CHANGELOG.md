@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.6.5
+
+### Bug fixes
+
+- Fix corrupted shades and jagged text edges in 4-bit grayscale PNG output by rounding pixels to the nearest of sixteen gray levels before encoding.
+
 ## 2.6.4
 
 ### Grayscale PNG output
