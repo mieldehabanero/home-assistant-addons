@@ -22,7 +22,10 @@ export const debug = false;
 export const chromiumExecutable = isAddOn ? "/usr/bin/chromium" : (options.chromium_executable || "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
 
 export const keepBrowserOpen = options.keep_browser_open || false;
-export const pushScreenshot = getPushScreenshotConfig(options);
+export const legacyOptions = {
+  push_screenshot_url: options.push_screenshot_url,
+  push_screenshot_name: options.push_screenshot_name,
+};
 
 if (!hassToken) {
   console.warn("No access token configured. UI will show configuration instructions.");
@@ -42,7 +45,8 @@ export function getPushScreenshotConfig(options) {
 
   const baseUrl = "http://localhost";
   const sourceUrl = new URL(url, baseUrl);
-  if (!url.startsWith("/") || url.startsWith("//") || sourceUrl.origin !== baseUrl) {
+  if (!url.startsWith("/") || url.startsWith("//") || sourceUrl.origin !== baseUrl ||
+      sourceUrl.pathname.startsWith("//")) {
     throw new Error("push_screenshot_url must be a relative screenshot URL starting with /");
   }
   return { sourceUrl, pathname: `/screenshots/${name}` };

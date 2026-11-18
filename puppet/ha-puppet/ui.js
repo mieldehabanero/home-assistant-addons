@@ -58,7 +58,7 @@ async function fetchHomeAssistantData() {
  * Handle UI page request
  * @param {http.ServerResponse} response - The HTTP response object
  */
-export async function handleUIRequest(response) {
+export async function handleUIRequest(response, pushSettings = { enabled: false }) {
   try {
     // If no token is configured, show instruction page
     if (!hassToken) {
@@ -156,10 +156,12 @@ export async function handleUIRequest(response) {
       JSON.stringify(data, null, 2).replace(/</g, "\\u003c");
     const hassScriptTag = `<script>window.hass = ${asScriptJson(hassData)};</script>`;
     const devicesScriptTag = `<script>window.devices = ${asScriptJson(devicesData)};</script>`;
-    html = html.replace("</head>", `${hassScriptTag}\n  ${devicesScriptTag}\n  </head>`);
+    const pushScriptTag = `<script>window.pushSettings = ${asScriptJson(pushSettings)};</script>`;
+    html = html.replace("</head>", () => `${hassScriptTag}\n  ${devicesScriptTag}\n  ${pushScriptTag}\n  </head>`);
 
     response.writeHead(200, {
       "Content-Type": "text/html",
+      "Cache-Control": "no-store",
       "Content-Length": Buffer.byteLength(html),
     });
     response.end(html);

@@ -3,11 +3,12 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { Browser } from "./screenshot.js";
-import { isAddOn, hassUrl, hassToken, keepBrowserOpen, pushScreenshot } from "./const.js";
+import { isAddOn, hassUrl, hassToken, keepBrowserOpen, getPushScreenshotConfig } from "./const.js";
 import { CannotOpenPageError } from "./error.js";
 import { handleUIRequest } from "./ui.js";
 import { loadDevicesConfig, getDeviceConfig } from "./devices.js";
 import { installShutdownHandlers } from "./shutdown.js";
+import { loadPushSettings, writePushSettings } from "./push-settings.js";
 
 // Maximum number of next requests to keep in memory
 const MAX_NEXT_REQUESTS = 100;
@@ -27,11 +28,45 @@ const tailwindCss = readFileSync(
 const MIN_VIEWPORT_DIM = 10;
 const MAX_VIEWPORT_DIM = 4000;
 const MAX_ZOOM = 10;
+const MAX_PUSH_SETTINGS_BYTES = 16_384;
 
 class InvalidScreenshotRequest extends Error {}
 
 function screenshotContentType(format) {
   return `image/${format}`;
+}
+
+function sendJson(response, status, data) {
+  response.writeHead(status, {
+    "Content-Type": "application/json",
+    "Cache-Control": "no-store",
+  });
+  response.end(JSON.stringify(data));
+}
+
+function parsePushSettings(settings) {
+  if (typeof settings?.enabled !== "boolean") {
+    throw new InvalidScreenshotRequest("Choose whether to enable push mode");
+  }
+  if (!settings.enabled) return;
+  if (typeof settings.name !== "string" || !/^[a-z0-9][a-z0-9_-]*$/.test(settings.name)) {
+    throw new InvalidScreenshotRequest("Use lowercase letters, digits, hyphens or underscores for the screenshot name");
+  }
+  if (typeof settings.source !== "string" || !settings.source.startsWith("/")) {
+    throw new InvalidScreenshotRequest("Enter a Home Assistant dashboard path starting with /");
+  }
+  try {
+    const push = getPushScreenshotConfig({
+      keep_browser_open: true,
+      push_screenshot_url: settings.source,
+      push_screenshot_name: settings.name,
+    });
+    push.sourceUrl.searchParams.delete("next");
+    push.sourceUrl.hash = "";
+    return push;
+  } catch {
+    throw new InvalidScreenshotRequest("Enter a Home Assistant dashboard path starting with a single /");
+  }
 }
 
 export class RequestHandler {
@@ -41,7 +76,7 @@ export class RequestHandler {
     if (push) {
       const { pathname, sourceUrl, settleMs = 250, reopenMs = 1000 } = push;
       const { requestParams, error } = RequestHandler.parseScreenshotRequest(sourceUrl);
-      if (error) throw error;
+      if (error) throw new InvalidScreenshotRequest(error.message || "Enter a valid screenshot viewport");
       this.push = {
         pathname,
         requestParams,
@@ -92,7 +127,7 @@ export class RequestHandler {
   _markBrowserAccessed() {
     clearTimeout(this.browserCleanupTimer);
     this.lastAccess = new Date();
-    if (keepBrowserOpen) {
+    if (keepBrowserOpen || this.push || this.retired) {
       return;
     }
     this.browserCleanupTimer = setTimeout(
@@ -101,7 +136,7 @@ export class RequestHandler {
     );
   }
 
-  async handleRequest(request, response) {
+  async handleRequest(request, response, pushSettings) {
     const requestUrl = new URL(request.url, "http://localhost");
 
     if (requestUrl.pathname === "/favicon.ico") {
@@ -120,7 +155,7 @@ export class RequestHandler {
     }
 
     if (requestUrl.pathname === "/") {
-      await handleUIRequest(response);
+      await handleUIRequest(response, pushSettings);
       return;
     }
 
@@ -381,7 +416,7 @@ export class RequestHandler {
       response.write(image);
       response.end();
 
-      if (!next) {
+      if (!next || this.retired) {
         return;
       }
 
@@ -473,6 +508,7 @@ export class RequestHandler {
   async captureScreenshot(requestParams, requestId) {
     const generation = this.pushPageGeneration;
     if (this.push) {
+      if (this.pushStopped) return;
       if (!this.pushPageReady) await this.openPushPage(requestParams, generation);
       if (!this.isCurrentPushPage(generation)) return;
     } else {
@@ -553,6 +589,15 @@ export class RequestHandler {
     this.pushTimer = undefined;
   }
 
+  retire(options) {
+    this.retired = true;
+    this.stopPushCapture();
+    clearTimeout(this.browserCleanupTimer);
+    for (const timer of this.nextRequests) clearTimeout(timer);
+    this.nextRequests.length = 0;
+    return this.runBrowserTask(() => this.browser.cleanup(options));
+  }
+
   async servePushScreenshot(request, response) {
     const cached = await this.requestScreenshot();
     if (!cached) {
@@ -599,20 +644,94 @@ export class RequestHandler {
   }
 }
 
-function startServer() {
-  const browser = new Browser(hassUrl, hassToken);
-  const requestHandler = new RequestHandler(browser, { push: pushScreenshot });
+async function startServer() {
+  let pushSettings = { enabled: false };
+  const createHandler = (config) => new RequestHandler(new Browser(hassUrl, hassToken), { push: config });
+  let requestHandler;
+  try {
+    const { settings, shouldSave } = await loadPushSettings();
+    const push = parsePushSettings(settings);
+    requestHandler = createHandler(push);
+    pushSettings = settings;
+    if (shouldSave) writePushSettings(settings);
+  } catch (error) {
+    console.error("Could not load or migrate push settings:", error.message);
+    requestHandler ??= createHandler();
+  }
+
+  async function saveSettings(request, response) {
+    if (request.method !== "PUT") {
+      response.writeHead(405, { Allow: "PUT" });
+      response.end();
+      return;
+    }
+    if (request.headers["content-type"]?.split(";")[0].trim() !== "application/json") {
+      sendJson(response, 415, { error: "Send settings as JSON" });
+      return;
+    }
+
+    const chunks = [];
+    let bytes = 0;
+    try {
+      for await (const chunk of request.iterator({ destroyOnReturn: false })) {
+        bytes += chunk.length;
+        if (bytes > MAX_PUSH_SETTINGS_BYTES) {
+          request.resume();
+          sendJson(response, 413, { error: "Screenshot settings are too large" });
+          return;
+        }
+        chunks.push(chunk);
+      }
+    } catch {
+      return;
+    }
+
+    let settings;
+    let nextHandler;
+    try {
+      const input = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      const config = parsePushSettings(input);
+      settings = config
+        ? { enabled: true, name: input.name, source: config.sourceUrl.pathname + config.sourceUrl.search }
+        : { ...pushSettings, enabled: false };
+      if (JSON.stringify(settings) !== JSON.stringify(pushSettings)) {
+        nextHandler = createHandler(config);
+      }
+    } catch (error) {
+      const message = error instanceof InvalidScreenshotRequest ? error.message : "Invalid screenshot settings";
+      sendJson(response, 400, { error: message });
+      return;
+    }
+
+    try {
+      writePushSettings(settings);
+    } catch (error) {
+      console.error("Could not save push settings:", error.message);
+      sendJson(response, 500, { error: "Could not save push settings" });
+      return;
+    }
+    if (nextHandler) {
+      const previousHandler = requestHandler;
+      requestHandler = nextHandler;
+      pushSettings = settings;
+      // Drain existing requests and close Chromium before opening the new dashboard.
+      void nextHandler.runBrowserTask(() => previousHandler.retire());
+    }
+    if (pushSettings.enabled) void requestHandler.requestScreenshot({ refresh: true });
+    sendJson(response, 200, pushSettings);
+  }
+
   const port = 10000;
-  const server = http.createServer((request, response) =>
-    requestHandler.handleRequest(request, response),
-  );
+  const server = http.createServer((request, response) => {
+    if (request.url === "/api/puppet/push-settings") return saveSettings(request, response);
+    return requestHandler.handleRequest(request, response, pushSettings);
+  });
   server.listen(port, () => {
-    if (pushScreenshot) void requestHandler.requestScreenshot({ refresh: true });
+    if (pushSettings.enabled) void requestHandler.requestScreenshot({ refresh: true });
   });
   installShutdownHandlers(server, {
     cleanup(options) {
-      requestHandler.stopPushCapture();
-      return browser.cleanup(options);
+      return requestHandler.retire(options);
     },
   });
   const now = new Date();

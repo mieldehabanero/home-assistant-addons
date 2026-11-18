@@ -24,8 +24,6 @@ _This is a prototype, there is NO security. Anyone can access the server and mak
 
 - home_assistant_url: Base URL of your Home Assistant instance that the add-on browser should open when taking screenshots. Defaults to `http://homeassistant:8123` which is the internal URL at which the add-on can reach Home Assistant. You can override it if your instance has configured SSL certificates inside Home Assistant and requires to be reached via a different hostname or port (e.g., http://my-ha.local:8123 or https://example.duckdns.org).
 - keep_browser_open: If true, keeps the Chromium browser alive between requests.
-- push_screenshot_url: A relative screenshot URL that enables push mode. Requires `keep_browser_open: true`.
-- push_screenshot_name: The name used in the push-mode image URL. Defaults to `dashboard`.
 
 ## Web UI
 
@@ -171,13 +169,11 @@ Providing a `next` parameter will not affect the current request. It will only b
 
 ### Push-only screenshots
 
-Push mode keeps one Home Assistant dashboard view open and serves its latest screenshot from memory. Configure the dashboard path and all rendering options in the add-on. To reuse a URL from the screenshot form, copy the path and query string.
+Push mode keeps one Home Assistant dashboard view open and serves its latest screenshot from memory. In Puppet’s Web UI, enable **Push mode**, set the screenshot name and dashboard path, and choose your rendering options. Select **Save push settings** to capture the dashboard and save your setup across restarts. Puppet keeps its browser open automatically in push mode.
 
-```yaml
-keep_browser_open: true
-push_screenshot_url: "/dashboard-kitchen/overview?viewport=800x480&png_mode=grayscale"
-push_screenshot_name: kitchen
-```
+Copy the **Client screenshot URL** into your display’s configuration. For example, the name `kitchen` gives clients `http://homeassistant.local:10000/screenshots/kitchen`. To return to on-demand captures, clear **Push mode** and save.
+
+When upgrading from Puppet 2.7.0, Puppet imports your previous push settings and keeps the same client URL.
 
 In a Home Assistant custom card or dashboard resource, call this when the dashboard decides a new screenshot is needed. For example, a card can call it after rendering updated values. The optional call also works when the dashboard is open in a regular browser without Puppet's callback.
 
@@ -187,7 +183,7 @@ await window.puppetRefreshScreenshot?.();
 
 Puppet groups nearby signals and gives the page a short time to finish rendering. It also captures when the dashboard first opens and when it reopens after a page or browser failure.
 
-Fetch the image at `http://homeassistant.local:10000/screenshots/kitchen`. In push mode this is the screenshot endpoint, and Puppet ignores URL query parameters on it, including `next`. The first GET against an empty cache can trigger a capture or wait for one already in progress. If no image is available after that attempt, Puppet returns `503`. Once it has an image, GETs serve the last successful capture, including during a refresh or after a failed refresh. Clients can send the response's `ETag` in `If-None-Match` to receive `304 Not Modified` when the cached image matches.
+Puppet ignores query parameters on the client screenshot URL. The first GET against an empty cache can trigger a capture or wait for one already in progress. If no image is available after that attempt, Puppet returns `503`. Once it has an image, GETs serve the last successful capture, including during a refresh or after a failed refresh. Clients can send the response's `ETag` in `If-None-Match` to receive `304 Not Modified` when the cached image matches.
 
 ## Using images inside Home Assistant
 

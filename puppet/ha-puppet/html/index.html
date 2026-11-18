@@ -67,6 +67,23 @@
             </button>
           </div>
 
+          <div class="mb-4 space-y-4">
+            <label for="pushEnabled" class="flex items-center gap-2 text-sm font-medium text-gray-700">
+              <input type="checkbox" id="pushEnabled" />
+              Push mode
+            </label>
+            <div id="pushNameContainer" class="hidden">
+              <label for="pushName" class="block text-sm font-medium text-gray-700 mb-1">Screenshot name</label>
+              <input type="text" id="pushName" value="dashboard" required pattern="[a-z0-9][a-z0-9_\-]*"
+                class="w-full px-3 py-2 border rounded-md" />
+            </div>
+            <button type="button" id="pushSaveButton" class="hidden px-4 py-2 text-white rounded-md"
+              style="background-color: var(--ha-blue)" onclick="savePushSettings()">
+              Save push settings
+            </button>
+            <p id="pushSettingsStatus" role="status" class="text-sm text-gray-700"></p>
+          </div>
+
           <form id="screenshotForm" class="space-y-4">
             <!-- Device Selector -->
             <div>
@@ -90,8 +107,8 @@
 
             <!-- Path -->
             <div>
-              <label class="block text-sm font-medium text-gray-700 mb-1"
-                >Path</label
+              <label for="path" class="block text-sm font-medium text-gray-700 mb-1"
+                >Dashboard path</label
               >
               <input
                 type="text"
@@ -159,7 +176,7 @@
             </div>
 
             <!-- Next -->
-            <div>
+            <div id="nextContainer">
               <label class="block text-sm font-medium text-gray-700 mb-1"
                 >Auto-refresh Interval (seconds, optional)</label
               >
@@ -530,7 +547,7 @@
 
           <!-- Generated URL -->
           <div class="mb-4">
-            <label class="block text-sm font-medium text-gray-700 mb-1"
+            <label id="generatedUrlLabel" for="generatedUrl" class="block text-sm font-medium text-gray-700 mb-1"
               >Generated URL</label
             >
             <div class="flex gap-2">
@@ -541,7 +558,7 @@
                 class="flex-1 px-3 py-2 bg-gray-50 border border-gray-300 rounded-md text-sm font-mono"
                 value=""
               />
-              <button
+              <button id="previewButton"
                 onclick="loadPreview(event)"
                 class="px-4 py-2 text-white rounded-md transition duration-200 shadow-md"
                 style="background-color: var(--ha-blue)"
@@ -550,7 +567,7 @@
               >
                 Preview
               </button>
-              <button
+              <button id="copyUrlButton"
                 onclick="copyUrl()"
                 class="px-4 py-2 text-white rounded-md transition duration-200"
                 style="background-color: #10b981"
@@ -873,6 +890,7 @@
 
       // Update browser URL to match current form settings
       function updateBrowserUrl() {
+        if (showingPushMode()) return;
         const device = document.getElementById("device").value;
         const path = document.getElementById("path").value || "/";
         const width = document.getElementById("width").value;
@@ -1017,88 +1035,7 @@
             url = new URL(urlString, "http://dummy");
           }
 
-          const urlParams = url.searchParams;
-          const pathname = url.pathname;
-
-          // Omitted parameters use request defaults, not the previous form values.
-          document.getElementById("screenshotForm").reset();
-          setViewportHeight(document.getElementById("height").value);
-          document.getElementById("device").value = urlParams.get("device") || "";
-          onDeviceChange();
-          document.getElementById("path").value = urlParams.get("path") || pathname;
-
-          // Parse viewport (widthxheight, or widthxauto)
-          const viewport = urlParams.get("viewport");
-          if (viewport) {
-            const [width, height] = viewport.split("x");
-            if (width) document.getElementById("width").value = width;
-            if (height) setViewportHeight(height);
-          }
-
-          // Load other parameters
-          if (urlParams.has("format")) {
-            document.getElementById("format").value = urlParams.get("format");
-          }
-          if (urlParams.has("theme")) {
-            document.getElementById("theme").value = urlParams.get("theme");
-          }
-          if (urlParams.has("dark")) {
-            document.getElementById("dark").checked = true;
-          } else {
-            document.getElementById("dark").checked = false;
-          }
-          if (urlParams.has("zoom")) {
-            document.getElementById("zoom").value = urlParams.get("zoom");
-          }
-          if (urlParams.has("wait")) {
-            document.getElementById("wait").value = urlParams.get("wait");
-          }
-          if (urlParams.has("lang")) {
-            document.getElementById("lang").value = urlParams.get("lang");
-          }
-
-          // Handle deprecated eink parameter - convert to colors
-          if (urlParams.has("eink") && !urlParams.has("colors")) {
-            const einkValue = parseInt(urlParams.get("eink"));
-            if (einkValue === 2) {
-              // Convert eink=2 to black and white colors
-              document.getElementById("colors").value = "000000,FFFFFF";
-              console.log('[eink migration] Imported URL with eink=2, converted to colors=000000,FFFFFF');
-              feedback.textContent = "⚠ Imported URL contained deprecated 'eink' parameter. Automatically converted to 'colors' parameter.";
-              feedback.classList.remove("hidden");
-            } else {
-              feedback.textContent = `⚠ Imported URL contained the removed 'eink=${einkValue}' parameter, which was ignored. Set the desired palette via the 'colors' field instead.`;
-              feedback.classList.remove("hidden");
-            }
-          } else if (urlParams.has("colors")) {
-            document.getElementById("colors").value = urlParams.get("colors");
-          }
-
-          if (urlParams.has("palette_colors")) {
-            document.getElementById("palette_colors").value = urlParams.get("palette_colors");
-          }
-          if (urlParams.has("dithering")) {
-            document.getElementById("dithering").value = urlParams.get("dithering");
-          }
-          if (urlParams.has("rotate")) {
-            document.getElementById("rotate").value = urlParams.get("rotate");
-          }
-          if (urlParams.has("invert")) {
-            document.getElementById("invert").checked = true;
-          } else {
-            document.getElementById("invert").checked = false;
-          }
-          if (urlParams.has("next")) {
-            document.getElementById("next").value = urlParams.get("next");
-          }
-
-          if (urlParams.has("png_mode")) {
-            document.getElementById("png_mode").value = urlParams.get("png_mode");
-          }
-          if (urlParams.has("bmp_mode")) {
-            const el = document.getElementById("bmp_mode");
-            if (el) el.value = urlParams.get("bmp_mode");
-          }
+          applyScreenshotUrl(url, feedback);
 
           // Update the UI
           updateUrl();
@@ -1112,6 +1049,92 @@
           console.error("Error importing URL:", e);
           error.textContent = "Invalid URL format. Please check and try again.";
           error.classList.remove("hidden");
+        }
+      }
+
+      function applyScreenshotUrl(url, feedback) {
+        const urlParams = url.searchParams;
+        const pathname = url.pathname;
+
+        // Omitted parameters use request defaults, not the previous form values.
+        document.getElementById("screenshotForm").reset();
+        setViewportHeight(document.getElementById("height").value);
+        const device = urlParams.get("device") || "";
+        document.getElementById("device").value = window.devices?.aliases?.[device] || device;
+        onDeviceChange(false);
+        document.getElementById("path").value = urlParams.get("path") || pathname;
+
+        // Parse viewport (widthxheight, or widthxauto)
+        const viewport = urlParams.get("viewport");
+        if (viewport) {
+          const [width, height] = viewport.split("x");
+          if (width) document.getElementById("width").value = width;
+          if (height) setViewportHeight(height);
+        }
+
+        // Load other parameters
+        if (urlParams.has("format")) {
+          document.getElementById("format").value = urlParams.get("format");
+        }
+        if (urlParams.has("theme")) {
+          document.getElementById("theme").value = urlParams.get("theme");
+        }
+        if (urlParams.has("dark")) {
+          document.getElementById("dark").checked = true;
+        } else {
+          document.getElementById("dark").checked = false;
+        }
+        if (urlParams.has("zoom")) {
+          document.getElementById("zoom").value = urlParams.get("zoom");
+        }
+        if (urlParams.has("wait")) {
+          document.getElementById("wait").value = urlParams.get("wait");
+        }
+        if (urlParams.has("lang")) {
+          document.getElementById("lang").value = urlParams.get("lang");
+        }
+
+        // Handle deprecated eink parameter - convert to colors
+        if (urlParams.has("eink") && !urlParams.has("colors")) {
+          const einkValue = parseInt(urlParams.get("eink"));
+          if (einkValue === 2) {
+            // Convert eink=2 to black and white colors
+            document.getElementById("colors").value = "000000,FFFFFF";
+            console.log('[eink migration] Imported URL with eink=2, converted to colors=000000,FFFFFF');
+            if (feedback) feedback.textContent = "⚠ Imported URL contained deprecated 'eink' parameter. Automatically converted to 'colors' parameter.";
+            feedback?.classList.remove("hidden");
+          } else {
+            if (feedback) feedback.textContent = `⚠ Imported URL contained the removed 'eink=${einkValue}' parameter, which was ignored. Set the desired palette via the 'colors' field instead.`;
+            feedback?.classList.remove("hidden");
+          }
+        } else if (urlParams.has("colors")) {
+          document.getElementById("colors").value = urlParams.get("colors");
+        }
+
+        if (urlParams.has("palette_colors")) {
+          document.getElementById("palette_colors").value = urlParams.get("palette_colors");
+        }
+        if (urlParams.has("dithering")) {
+          document.getElementById("dithering").value = urlParams.get("dithering");
+        }
+        if (urlParams.has("rotate")) {
+          document.getElementById("rotate").value = urlParams.get("rotate");
+        }
+        if (urlParams.has("invert")) {
+          document.getElementById("invert").checked = true;
+        } else {
+          document.getElementById("invert").checked = false;
+        }
+        if (urlParams.has("next")) {
+          document.getElementById("next").value = urlParams.get("next");
+        }
+
+        if (urlParams.has("png_mode")) {
+          document.getElementById("png_mode").value = urlParams.get("png_mode");
+        }
+        if (urlParams.has("bmp_mode")) {
+          const el = document.getElementById("bmp_mode");
+          if (el) el.value = urlParams.get("bmp_mode");
         }
       }
 
@@ -1239,7 +1262,7 @@
           params.append("invert", "");
         }
 
-        if (next) {
+        if (next && !showingPushMode()) {
           params.append("next", next);
         }
 
@@ -1258,10 +1281,70 @@
         return url;
       }
 
+      let pushSettings = window.pushSettings || { enabled: false };
+      const pushEnabled = document.getElementById("pushEnabled");
+      const pushName = document.getElementById("pushName");
+      const pushSaveButton = document.getElementById("pushSaveButton");
+      const pushStatus = document.getElementById("pushSettingsStatus");
+
+      function showingPushMode() {
+        return pushEnabled.checked || pushSettings.enabled;
+      }
+
+      async function savePushSettings() {
+        if (pushSaveButton.disabled) return;
+        const enabled = pushEnabled.checked;
+        if (enabled && (!pushName.reportValidity() ||
+            !document.getElementById("screenshotForm").reportValidity())) return;
+
+        const settings = enabled
+          ? { enabled, name: pushName.value, source: buildUrl().slice(window.location.origin.length) }
+          : { enabled };
+        pushSaveButton.disabled = true;
+        pushEnabled.disabled = true;
+        pushStatus.textContent = "Saving…";
+
+        try {
+          const response = await fetch("/api/puppet/push-settings", {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(settings),
+          });
+          const result = await response.json();
+          if (!response.ok) throw new Error(result.error || "Could not save push settings");
+          pushSettings = result;
+          if (result.enabled) history.replaceState({}, "", window.location.pathname);
+          pushStatus.textContent = result.enabled ? "Push settings saved." : "Push mode disabled.";
+          updateUrl();
+          updateBrowserUrl();
+          void loadPreview();
+        } catch (error) {
+          pushStatus.textContent = error.message;
+        } finally {
+          pushSaveButton.disabled = false;
+          pushEnabled.disabled = false;
+        }
+      }
+
       // Update the displayed URL
       function updateUrl() {
-        const url = buildUrl();
-        document.getElementById("generatedUrl").value = url;
+        const pushMode = showingPushMode();
+        let url = "";
+        if (pushSettings.enabled) {
+          url = `${window.location.origin}/screenshots/${pushSettings.name}`;
+        } else if (!pushMode) {
+          url = buildUrl();
+        }
+        const urlInput = document.getElementById("generatedUrl");
+        urlInput.value = url;
+        urlInput.placeholder = pushMode ? "Save push settings to get the screenshot URL" : "";
+        document.getElementById("generatedUrlLabel").textContent = pushMode ? "Client screenshot URL" : "Generated URL";
+        document.getElementById("previewButton").disabled = !url;
+        document.getElementById("copyUrlButton").disabled = !url;
+        document.getElementById("nextContainer").classList.toggle("hidden", pushMode);
+        document.getElementById("next").disabled = pushMode;
+        document.getElementById("pushNameContainer").classList.toggle("hidden", !pushEnabled.checked);
+        pushSaveButton.classList.toggle("hidden", !pushMode);
         // Show or hide mode controls based on format
         const fmt = document.getElementById("format").value;
         const pngContainer = document.getElementById("pngModeContainer");
@@ -1291,7 +1374,8 @@
       async function loadPreview(e) {
         if (e) e.preventDefault();
 
-        const fullUrl = buildUrl();
+        const fullUrl = document.getElementById("generatedUrl").value;
+        if (!fullUrl) return;
         const previewImage = document.getElementById("previewImage");
         const loadingIndicator = document.getElementById("loadingIndicator");
         const errorMessage = document.getElementById("errorMessage");
@@ -1429,7 +1513,7 @@
       }
 
       // Handle device selection change
-      function onDeviceChange() {
+      function onDeviceChange(update = true) {
         const deviceId = document.getElementById("device").value;
 
         if (!deviceId || !window.devices?.devices) {
@@ -1470,10 +1554,11 @@
           document.getElementById("dithering").value = device.dithering;
         }
 
-        // Update URL and save settings
-        updateUrl();
-        updateBrowserUrl();
-        saveSettings();
+        if (update) {
+          updateUrl();
+          updateBrowserUrl();
+          saveSettings();
+        }
       }
 
       // Populate theme picker with available themes
@@ -1516,8 +1601,15 @@
         .getElementById("screenshotForm")
         .addEventListener("submit", (e) => {
           e.preventDefault();
-          loadPreview(e);
+          if (showingPushMode()) void savePushSettings();
+          else loadPreview(e);
         });
+
+      pushEnabled.addEventListener("change", () => {
+        pushStatus.textContent = "";
+        updateUrl();
+        updateBrowserUrl();
+      });
 
       // Update URL and save settings when any input changes
       document
@@ -1545,7 +1637,7 @@
             if (input.id === "device") {
               onDeviceChange();
             }
-            loadPreview();
+            if (!showingPushMode()) loadPreview();
           });
         });
 
@@ -1561,11 +1653,17 @@
         populateDevicePicker();
         populateThemePicker();
 
-        // Load from URL first (highest priority), then localStorage
-        loadFromUrl();
-        // Only load from localStorage if URL params are not present
-        if (!window.location.search) {
-          loadSettings();
+        pushEnabled.checked = pushSettings.enabled;
+        pushName.value = pushSettings.name || "dashboard";
+        if (pushSettings.enabled) {
+          const source = new URL(pushSettings.source, window.location.origin);
+          source.searchParams.delete("path");
+          applyScreenshotUrl(source);
+          history.replaceState({}, "", window.location.pathname);
+        } else {
+          // Load from URL first (highest priority), then localStorage
+          loadFromUrl();
+          if (!window.location.search) loadSettings();
         }
 
         // Initialize device config for URL building after loading settings
