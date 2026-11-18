@@ -1,7 +1,9 @@
 import http from "node:http";
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
 import { Browser } from "./screenshot.js";
-import { isAddOn, hassUrl, hassToken, keepBrowserOpen } from "./const.js";
+import { isAddOn, hassUrl, hassToken, keepBrowserOpen, pushScreenshot } from "./const.js";
 import { CannotOpenPageError } from "./error.js";
 import { handleUIRequest } from "./ui.js";
 import { loadDevicesConfig, getDeviceConfig } from "./devices.js";
@@ -26,12 +28,32 @@ const MIN_VIEWPORT_DIM = 10;
 const MAX_VIEWPORT_DIM = 4000;
 const MAX_ZOOM = 10;
 
-class RequestHandler {
-  constructor(browser) {
+class InvalidScreenshotRequest extends Error {}
+
+function screenshotContentType(format) {
+  return `image/${format}`;
+}
+
+export class RequestHandler {
+  constructor(browser, { push, logger = console } = {}) {
     this.browser = browser;
+    this.logger = logger;
+    if (push) {
+      const { pathname, sourceUrl, settleMs = 250, reopenMs = 1000 } = push;
+      const { requestParams, error } = RequestHandler.parseScreenshotRequest(sourceUrl);
+      if (error) throw error;
+      this.push = {
+        pathname,
+        requestParams,
+        origin: new URL(browser.homeAssistantUrl).origin,
+        settleMs,
+        reopenMs,
+      };
+      this.pushPageGeneration = 0;
+    }
     this.busy = false;
 
-    // Pending web requests
+    // Pending browser tasks
     this.pending = [];
 
     // Request counter to identify requests
@@ -102,21 +124,24 @@ class RequestHandler {
       return;
     }
 
-    const requestId = ++this.requestCount;
-    console.debug(requestId, "Request", request.url);
-
-    const start = new Date();
-    if (this.busy) {
-      console.log(requestId, "Busy, waiting in queue");
-      await new Promise((resolve) => this.pending.push(resolve));
-      const end = Date.now();
-      console.log(requestId, `Wait time: ${end - start} ms`);
+    if (this.push) {
+      if (requestUrl.pathname !== this.push.pathname) {
+        response.statusCode = 404;
+        response.end();
+      } else if (request.method !== "GET") {
+        response.writeHead(405, { Allow: "GET" });
+        response.end();
+      } else {
+        await this.servePushScreenshot(request, response);
+      }
+      return;
     }
-    this.busy = true;
 
+    await this.handleOnDemandRequest(request, response, requestUrl);
+  }
+
+  static parseScreenshotRequest(requestUrl) {
     try {
-      console.debug(requestId, "Handling", request.url);
-
       // Load device configurations
       const devicesData = loadDevicesConfig();
 
@@ -126,9 +151,7 @@ class RequestHandler {
       if (deviceParam) {
         deviceConfig = getDeviceConfig(deviceParam, devicesData);
         if (!deviceConfig) {
-          response.statusCode = 400;
-          response.end(`Unknown device: ${deviceParam}`);
-          return;
+          throw new InvalidScreenshotRequest(`Unknown device: ${deviceParam}`);
         }
       }
 
@@ -161,9 +184,7 @@ class RequestHandler {
         viewportParams.length != 2 ||
         !viewportParams.every((x) => !isNaN(x))
       ) {
-        response.statusCode = 400;
-        response.end();
-        return;
+        throw new InvalidScreenshotRequest();
       }
 
       if (
@@ -171,11 +192,9 @@ class RequestHandler {
           (x) => x >= MIN_VIEWPORT_DIM && x <= MAX_VIEWPORT_DIM,
         )
       ) {
-        response.statusCode = 400;
-        response.end(
+        throw new InvalidScreenshotRequest(
           `Viewport dimensions must be between ${MIN_VIEWPORT_DIM} and ${MAX_VIEWPORT_DIM} pixels`,
         );
-        return;
       }
 
       let einkColors = parseInt(requestUrl.searchParams.get("eink"));
@@ -225,11 +244,9 @@ class RequestHandler {
         } else {
           // Other palette sizes are no longer supported; fail loudly instead
           // of silently returning a full-color screenshot.
-          response.statusCode = 400;
-          response.end(
+          throw new InvalidScreenshotRequest(
             `The "eink=${einkColors}" parameter is no longer supported. Use "colors" with a comma-separated list of hex colors instead, e.g. colors=000000,555555,AAAAAA,FFFFFF`,
           );
-          return;
         }
       }
 
@@ -308,6 +325,30 @@ class RequestHandler {
         dark,
       };
 
+      return { requestParams };
+    } catch (error) {
+      if (!(error instanceof InvalidScreenshotRequest)) throw error;
+      return { error };
+    }
+  }
+
+  async handleOnDemandRequest(request, response, requestUrl) {
+    const requestId = ++this.requestCount;
+    console.debug(requestId, "Request", request.url);
+
+    const start = new Date();
+
+    try {
+      console.debug(requestId, "Handling", request.url);
+
+      const { requestParams, error } =
+        RequestHandler.parseScreenshotRequest(requestUrl);
+      if (error) {
+        response.statusCode = 400;
+        response.end(error.message);
+        return;
+      }
+
       // Extract next param and schedule if necessary
       const nextParam = requestUrl.searchParams.get("next");
       let next = parseInt(nextParam);
@@ -317,16 +358,7 @@ class RequestHandler {
 
       let image;
       try {
-        const navigateResult = await this.browser.navigatePage(requestParams);
-        console.debug(requestId, `Navigated in ${navigateResult.time} ms`);
-        this.navigationTime = Math.max(
-          this.navigationTime,
-          navigateResult.time,
-        );
-        const screenshotResult =
-          await this.browser.screenshotPage(requestParams);
-        console.debug(requestId, `Screenshot in ${screenshotResult.time} ms`);
-        image = screenshotResult.image;
+        image = await this.requestScreenshot({ requestParams, requestId });
       } catch (err) {
         if (err instanceof CannotOpenPageError) {
           console.error(requestId, `Cannot open page: ${err.message}`);
@@ -342,21 +374,8 @@ class RequestHandler {
         throw err;
       }
 
-      // If eink processing happened, the format could be png or bmp
-      const responseFormat = format;
-      let contentType;
-      if (responseFormat === "jpeg") {
-        contentType = "image/jpeg";
-      } else if (responseFormat === "webp") {
-        contentType = "image/webp";
-      } else if (responseFormat === "bmp") {
-        contentType = "image/bmp";
-      } else {
-        contentType = "image/png";
-      }
-
       response.writeHead(200, {
-        "Content-Type": contentType,
+        "Content-Type": screenshotContentType(requestParams.format),
         "Content-Length": image.length,
       });
       response.write(image);
@@ -396,13 +415,170 @@ class RequestHandler {
         clearTimeout(this.nextRequests.shift());
       }
     } finally {
-      this.busy = false;
-      const resolve = this.pending.shift();
-      if (resolve) {
-        resolve();
-      }
       this._markBrowserAccessed();
     }
+  }
+
+  async runBrowserTask(task) {
+    if (this.busy) {
+      await new Promise((resolve) => this.pending.push(resolve));
+    } else {
+      this.busy = true;
+    }
+
+    try {
+      return await task();
+    } finally {
+      const next = this.pending.shift();
+      // Keep the browser reserved while the next task resumes.
+      if (next) next();
+      else this.busy = false;
+    }
+  }
+
+  requestScreenshot({
+    requestParams = this.push?.requestParams,
+    requestId,
+    refresh = false,
+  } = {}) {
+    if (this.push) {
+      if (this.pushStopped || (!refresh && this.cachedScreenshot)) {
+        return Promise.resolve(this.cachedScreenshot);
+      }
+      if (this.pushCapture) {
+        if (refresh) this.pushRefreshPending = true;
+        return this.pushCapture;
+      }
+      clearTimeout(this.pushTimer);
+      this.pushTimer = undefined;
+    }
+
+    const capture = this.runBrowserTask(() => this.captureScreenshot(requestParams, requestId));
+    if (!this.push) return capture;
+
+    this.pushCapture = capture
+      .catch((error) => {
+        if (!this.pushStopped) this.logger.error("Push screenshot capture failed:", error);
+      })
+      .finally(() => {
+        this.pushCapture = undefined;
+        if (this.pushRefreshPending) {
+          this.pushRefreshPending = false;
+          this.schedulePushCapture(this.push.settleMs);
+        }
+      });
+    return this.pushCapture;
+  }
+
+  async captureScreenshot(requestParams, requestId) {
+    const generation = this.pushPageGeneration;
+    if (this.push) {
+      if (!this.pushPageReady) await this.openPushPage(requestParams, generation);
+      if (!this.isCurrentPushPage(generation)) return;
+    } else {
+      const { time } = await this.browser.navigatePage(requestParams);
+      console.debug(requestId, `Navigated in ${time} ms`);
+      this.navigationTime = Math.max(this.navigationTime, time);
+    }
+
+    const { image, time } = await this.browser.screenshotPage(requestParams);
+    if (!this.push) {
+      console.debug(requestId, `Screenshot in ${time} ms`);
+      return image;
+    }
+
+    if (this.isCurrentPushPage(generation)) {
+      const etag = `"${createHash("sha256").update(image).digest("hex")}"`;
+      this.cachedScreenshot = { image, etag };
+    }
+    return this.cachedScreenshot;
+  }
+
+  isCurrentPushPage(generation) {
+    // A closed page can still have a capture or a dashboard callback in flight.
+    return !this.pushStopped && generation === this.pushPageGeneration;
+  }
+
+  schedulePushCapture(delay) {
+    if (this.pushStopped || this.pushTimer !== undefined) return;
+    this.pushTimer = setTimeout(() => {
+      this.pushTimer = undefined;
+      void this.requestScreenshot({ refresh: true });
+    }, delay);
+  }
+
+  async openPushPage(requestParams, generation) {
+    const onClose = () => {
+      if (!this.isCurrentPushPage(generation)) return;
+      this.pushPageGeneration++;
+      this.pushPageReady = false;
+      this.schedulePushCapture(this.push.reopenMs);
+    };
+
+    try {
+      await this.browser.cleanup();
+      await this.browser.navigatePage(requestParams, {
+        requireReady: true,
+        configurePage: async (page) => {
+          const chromium = page.browser();
+          const pageLost = () => {
+            page.off("close", pageLost);
+            page.off("error", pageLost);
+            chromium.off("disconnected", pageLost);
+            onClose();
+          };
+          page.once("close", pageLost);
+          page.once("error", pageLost);
+          chromium.once("disconnected", pageLost);
+          await page.exposeFunction("puppetRefreshScreenshot", () => {
+            if (
+              this.isCurrentPushPage(generation) &&
+              new URL(page.url()).origin === this.push.origin
+            ) {
+              this.schedulePushCapture(this.push.settleMs);
+            }
+          });
+        },
+      });
+      if (this.isCurrentPushPage(generation)) this.pushPageReady = true;
+    } catch (error) {
+      onClose();
+      throw error;
+    }
+  }
+
+  stopPushCapture() {
+    this.pushStopped = true;
+    clearTimeout(this.pushTimer);
+    this.pushTimer = undefined;
+  }
+
+  async servePushScreenshot(request, response) {
+    const cached = await this.requestScreenshot();
+    if (!cached) {
+      response.writeHead(503, { "Cache-Control": "no-store" });
+      response.end("Screenshot unavailable");
+      return;
+    }
+
+    const { image, etag } = cached;
+    const headers = { ETag: etag, "Cache-Control": "private, no-cache" };
+    const validator = request.headers["if-none-match"];
+    const matches = validator?.trim() === "*" || validator?.split(",").some(
+      (tag) => tag.trim().replace(/^W\//, "") === etag,
+    );
+    if (matches) {
+      response.writeHead(304, headers);
+      response.end();
+      return;
+    }
+
+    response.writeHead(200, {
+      ...headers,
+      "Content-Type": screenshotContentType(this.push.requestParams.format),
+      "Content-Length": image.length,
+    });
+    response.end(image);
   }
 
   async prepareNextRequest(requestId, requestParams) {
@@ -411,34 +587,41 @@ class RequestHandler {
       return;
     }
     requestId = `${requestId}-next`;
-    this.busy = true;
     console.log(requestId, "Preparing next request");
     try {
-      const navigateResult = await this.browser.navigatePage(requestParams);
-      console.debug(requestId, `Navigated in ${navigateResult.time} ms`);
+      const { time } = await this.runBrowserTask(() => this.browser.navigatePage(requestParams));
+      console.debug(requestId, `Navigated in ${time} ms`);
     } catch (err) {
       console.error(requestId, "Error preparing next request", err);
     } finally {
-      this.busy = false;
-      const resolve = this.pending.shift();
-      if (resolve) {
-        resolve();
-      }
       this._markBrowserAccessed();
     }
   }
 }
 
-const browser = new Browser(hassUrl, hassToken);
-const requestHandler = new RequestHandler(browser);
-const port = 10000;
-const server = http.createServer((request, response) =>
-  requestHandler.handleRequest(request, response),
-);
-server.listen(port);
-installShutdownHandlers(server, browser);
-const now = new Date();
-const serverUrl = isAddOn
-  ? `http://homeassistant.local:${port}`
-  : `http://localhost:${port}`;
-console.log(`[${now.toLocaleTimeString()}] Visit server at ${serverUrl}`);
+function startServer() {
+  const browser = new Browser(hassUrl, hassToken);
+  const requestHandler = new RequestHandler(browser, { push: pushScreenshot });
+  const port = 10000;
+  const server = http.createServer((request, response) =>
+    requestHandler.handleRequest(request, response),
+  );
+  server.listen(port, () => {
+    if (pushScreenshot) void requestHandler.requestScreenshot({ refresh: true });
+  });
+  installShutdownHandlers(server, {
+    cleanup(options) {
+      requestHandler.stopPushCapture();
+      return browser.cleanup(options);
+    },
+  });
+  const now = new Date();
+  const serverUrl = isAddOn
+    ? `http://homeassistant.local:${port}`
+    : `http://localhost:${port}`;
+  console.log(`[${now.toLocaleTimeString()}] Visit server at ${serverUrl}`);
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  startServer();
+}
