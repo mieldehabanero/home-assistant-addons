@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.7.1
+
+### Push-only screenshots
+
+- Configure push mode, the dashboard, and rendering options in Puppet's Web UI. Save the settings and copy the client screenshot URL from the same page.
+- Keep Chromium open automatically in push mode and import existing push settings so display URLs stay the same after upgrading.
+
 ## 2.7.0
 
 ### Push-only screenshots
