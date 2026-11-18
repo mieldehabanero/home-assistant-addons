@@ -1,4 +1,5 @@
 import { readFileSync, existsSync } from "fs";
+import { getPushScreenshotConfig } from "./push-capture.js";
 
 // load first file that exists
 const optionsFile = ["./options-dev.json", "/data/options.json"].find(
@@ -22,6 +23,7 @@ export const debug = false;
 export const chromiumExecutable = isAddOn ? "/usr/bin/chromium" : (options.chromium_executable || "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
 
 export const keepBrowserOpen = options.keep_browser_open || false;
+export const pushScreenshot = getPushScreenshotConfig(options);
 
 if (!hassToken) {
   console.warn("No access token configured. UI will show configuration instructions.");

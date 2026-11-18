@@ -17,3 +17,5 @@ schema:
   access_token: password
   keep_browser_open: bool
   home_assistant_url: str
+  push_screenshot_url: str?
+  push_screenshot_name: str?

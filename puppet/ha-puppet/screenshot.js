@@ -398,7 +398,7 @@ export class Browser {
     lang,
     theme,
     dark,
-  }) {
+  }, { configurePage, requireReady = false } = {}) {
     let start = new Date();
     if (this.busy) {
       throw new Error("Browser is busy");
@@ -409,6 +409,7 @@ export class Browser {
 
     try {
       const page = await this.getPage();
+      if (configurePage) await configurePage(page);
 
       // We add 56px to the height to account for the header
       // We'll cut that off from the screenshot
@@ -552,6 +553,7 @@ export class Browser {
         );
       } catch (err) {
         console.log("Timeout waiting for HA to finish loading");
+        if (requireReady) throw err;
       }
 
       // If the access token is missing/invalid/expired, Home Assistant

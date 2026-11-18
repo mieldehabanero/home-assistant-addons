@@ -1,11 +1,13 @@
 import http from "node:http";
 import { readFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
 import { Browser } from "./screenshot.js";
-import { isAddOn, hassUrl, hassToken, keepBrowserOpen } from "./const.js";
+import { isAddOn, hassUrl, hassToken, keepBrowserOpen, pushScreenshot } from "./const.js";
 import { CannotOpenPageError } from "./error.js";
 import { handleUIRequest } from "./ui.js";
 import { loadDevicesConfig, getDeviceConfig } from "./devices.js";
 import { installShutdownHandlers } from "./shutdown.js";
+import { PushCapture } from "./push-capture.js";
 
 // Maximum number of next requests to keep in memory
 const MAX_NEXT_REQUESTS = 100;
@@ -26,9 +28,201 @@ const MIN_VIEWPORT_DIM = 10;
 const MAX_VIEWPORT_DIM = 4000;
 const MAX_ZOOM = 10;
 
-class RequestHandler {
-  constructor(browser) {
+class InvalidScreenshotRequest extends Error {}
+
+function parseScreenshotRequest(requestUrl) {
+  // Load device configurations
+  const devicesData = loadDevicesConfig();
+
+  // Check for device parameter and apply device configuration
+  const deviceParam = requestUrl.searchParams.get("device");
+  let deviceConfig = null;
+  if (deviceParam) {
+    deviceConfig = getDeviceConfig(deviceParam, devicesData);
+    if (!deviceConfig) {
+      throw new InvalidScreenshotRequest(`Unknown device: ${deviceParam}`);
+    }
+  }
+
+  let extraWait = parseInt(requestUrl.searchParams.get("wait"));
+  if (isNaN(extraWait)) {
+    extraWait = undefined;
+  }
+
+  // Get viewport - use device config as default if device is specified.
+  // The height may be the literal "auto" (e.g. "1000xauto") to capture the
+  // whole scrollable page; the captured height is then derived from the
+  // rendered content and capped (see MAX_AUTO_HEIGHT in screenshot.js).
+  let autoHeight = false;
+  let viewportParams;
+  const viewportQuery = requestUrl.searchParams.get("viewport");
+  if (viewportQuery) {
+    const [widthStr, heightStr] = viewportQuery.split("x");
+    autoHeight = (heightStr || "").toLowerCase() === "auto";
+    viewportParams = [
+      parseInt(widthStr),
+      autoHeight ? AUTO_RENDER_HEIGHT : parseInt(heightStr),
+    ];
+  } else if (deviceConfig) {
+    viewportParams = [deviceConfig.width, deviceConfig.height];
+  } else {
+    viewportParams = [];
+  }
+
+  if (
+    viewportParams.length != 2 ||
+    !viewportParams.every((x) => !isNaN(x))
+  ) {
+    throw new InvalidScreenshotRequest();
+  }
+
+  if (
+    !viewportParams.every(
+      (x) => x >= MIN_VIEWPORT_DIM && x <= MAX_VIEWPORT_DIM,
+    )
+  ) {
+    throw new InvalidScreenshotRequest(
+      `Viewport dimensions must be between ${MIN_VIEWPORT_DIM} and ${MAX_VIEWPORT_DIM} pixels`,
+    );
+  }
+
+  let einkColors = parseInt(requestUrl.searchParams.get("eink"));
+  if (isNaN(einkColors) || einkColors < 2) {
+    einkColors = undefined;
+  }
+
+  // Supported colours as hex: colors=FF0000,00FF00,0000FF,... or colors=#FF0000,#00FF00,#0000FF,...
+  // Use device config as default if available
+  const colorsQuery = requestUrl.searchParams.get("colors");
+  const colorsString = colorsQuery !== null ? colorsQuery : (deviceConfig?.colors || "");
+  let colors = colorsString
+    .split(",")
+    .map((color) => color.trim())
+    .map((color) => color.startsWith("#") ? color : `#${color}`)
+    .filter((color) => /^#[0-9A-F]{6}$/i.test(color));
+
+  // Palette colours for quantization (pixels matched to these, then mapped to colors)
+  // Use device config as default if available
+  const paletteColorsQuery = requestUrl.searchParams.get("palette_colors");
+  const paletteColorsString = paletteColorsQuery !== null ? paletteColorsQuery : (deviceConfig?.palette_colors || "");
+  let paletteColors = paletteColorsString
+    .split(",")
+    .map((color) => color.trim())
+    .map((color) => color.startsWith("#") ? color : `#${color}`)
+    .filter((color) => /^#[0-9A-F]{6}$/i.test(color));
+
+  // Validate that colors and paletteColors have the same length if both are provided
+  if (colors.length > 0 && paletteColors.length > 0 && colors.length !== paletteColors.length) {
+    // Mismatch - clear paletteColors to ignore it
+    paletteColors = [];
+  }
+
+  // Handle eink parameter deprecation and mutual exclusivity with colors
+  if (einkColors !== undefined) {
+    console.warn('[DEPRECATED] The "eink" query parameter is deprecated. Please use "colors" instead. Example: colors=000000,FFFFFF for black and white.');
+
+    // Convert eink=2 to black and white colors for backward compatibility
+    if (einkColors === 2 && colors.length === 0) {
+      colors = ["#000000", "#FFFFFF"];
+      console.log('[eink migration] Converted eink=2 to colors=000000,FFFFFF');
+      einkColors = undefined;
+    } else if (colors.length > 0) {
+      // colors parameter takes precedence - ignore eink
+      console.warn('[eink ignored] Both "eink" and "colors" parameters provided. Using "colors" and ignoring "eink".');
+      einkColors = undefined;
+    } else {
+      // Other palette sizes are no longer supported; fail loudly instead
+      // of silently returning a full-color screenshot.
+      throw new InvalidScreenshotRequest(
+        `The "eink=${einkColors}" parameter is no longer supported. Use "colors" with a comma-separated list of hex colors instead, e.g. colors=000000,555555,AAAAAA,FFFFFF`,
+      );
+    }
+  }
+
+  // If palette_colors is empty, use colors as the palette
+  if (paletteColors.length === 0 && colors.length > 0) {
+    paletteColors = colors;
+  }
+
+  let zoom = parseFloat(requestUrl.searchParams.get("zoom"));
+  if (isNaN(zoom) || zoom <= 0 || zoom > MAX_ZOOM) {
+    zoom = 1;
+  }
+
+  const invert = requestUrl.searchParams.has("invert");
+
+  let format = requestUrl.searchParams.get("format") || "png";
+  if (!["png", "jpeg", "webp", "bmp"].includes(format)) {
+    format = "png";
+  }
+
+  let pngMode = requestUrl.searchParams.get("png_mode") || "color";
+  if (!["color", "grayscale"].includes(pngMode)) {
+    pngMode = "color";
+  }
+
+  // BMP mode: 'color' (24-bit), 'grayscale' (8-bit), 'binary' (1-bit)
+  let bmpMode = requestUrl.searchParams.get("bmp_mode") || "color";
+  if (!["color", "grayscale", "binary"].includes(bmpMode)) {
+    bmpMode = "color";
+  }
+
+  let rotate = parseInt(requestUrl.searchParams.get("rotate"));
+  if (isNaN(rotate) || ![90, 180, 270].includes(rotate)) {
+    rotate = undefined;
+  }
+
+  const lang = requestUrl.searchParams.get("lang") || undefined;
+  const theme = requestUrl.searchParams.get("theme") || undefined;
+  // undefined means "not requested": when neither dark nor theme is given
+  const dark = requestUrl.searchParams.has("dark") ? true : undefined;
+
+  // Dithering algorithm
+  // Use device config as default if available
+  const ditheringQuery = requestUrl.searchParams.get("dithering");
+  let dithering = ditheringQuery !== null ? ditheringQuery : (deviceConfig?.dithering || "none");
+  const validDitheringAlgorithms = [
+    "none",
+    "floyd-steinberg",
+    "atkinson",
+    "jarvis-judice-ninke",
+    "stucki",
+    "burkes",
+    "sierra",
+    "sierra-lite"
+  ];
+  if (!validDitheringAlgorithms.includes(dithering)) {
+    dithering = "none";
+  }
+
+  return {
+    pagePath: requestUrl.pathname,
+    viewport: { width: viewportParams[0], height: viewportParams[1] },
+    extraWait,
+    colors,
+    paletteColors,
+    dithering,
+    invert,
+    autoHeight,
+    zoom,
+    format,
+    pngMode,
+    bmpMode,
+    rotate,
+    lang,
+    theme,
+    dark,
+  };
+}
+
+function screenshotContentType(format) {
+  return `image/${format}`;
+}
+
+export class RequestHandler {
+  constructor(browser, { push } = {}) {
     this.browser = browser;
+    this.push = push;
     this.busy = false;
 
     // Pending web requests
@@ -102,6 +296,19 @@ class RequestHandler {
       return;
     }
 
+    if (this.push) {
+      if (requestUrl.pathname !== this.push.pathname) {
+        response.statusCode = 404;
+        response.end();
+      } else if (request.method !== "GET") {
+        response.writeHead(405, { Allow: "GET" });
+        response.end();
+      } else {
+        await this.push.cache.serve(request, response);
+      }
+      return;
+    }
+
     const requestId = ++this.requestCount;
     console.debug(requestId, "Request", request.url);
 
@@ -117,196 +324,15 @@ class RequestHandler {
     try {
       console.debug(requestId, "Handling", request.url);
 
-      // Load device configurations
-      const devicesData = loadDevicesConfig();
-
-      // Check for device parameter and apply device configuration
-      const deviceParam = requestUrl.searchParams.get("device");
-      let deviceConfig = null;
-      if (deviceParam) {
-        deviceConfig = getDeviceConfig(deviceParam, devicesData);
-        if (!deviceConfig) {
-          response.statusCode = 400;
-          response.end(`Unknown device: ${deviceParam}`);
-          return;
-        }
-      }
-
-      let extraWait = parseInt(requestUrl.searchParams.get("wait"));
-      if (isNaN(extraWait)) {
-        extraWait = undefined;
-      }
-
-      // Get viewport - use device config as default if device is specified.
-      // The height may be the literal "auto" (e.g. "1000xauto") to capture the
-      // whole scrollable page; the captured height is then derived from the
-      // rendered content and capped (see MAX_AUTO_HEIGHT in screenshot.js).
-      let autoHeight = false;
-      let viewportParams;
-      const viewportQuery = requestUrl.searchParams.get("viewport");
-      if (viewportQuery) {
-        const [widthStr, heightStr] = viewportQuery.split("x");
-        autoHeight = (heightStr || "").toLowerCase() === "auto";
-        viewportParams = [
-          parseInt(widthStr),
-          autoHeight ? AUTO_RENDER_HEIGHT : parseInt(heightStr),
-        ];
-      } else if (deviceConfig) {
-        viewportParams = [deviceConfig.width, deviceConfig.height];
-      } else {
-        viewportParams = [];
-      }
-
-      if (
-        viewportParams.length != 2 ||
-        !viewportParams.every((x) => !isNaN(x))
-      ) {
+      let requestParams;
+      try {
+        requestParams = parseScreenshotRequest(requestUrl);
+      } catch (error) {
+        if (!(error instanceof InvalidScreenshotRequest)) throw error;
         response.statusCode = 400;
-        response.end();
+        response.end(error.message);
         return;
       }
-
-      if (
-        !viewportParams.every(
-          (x) => x >= MIN_VIEWPORT_DIM && x <= MAX_VIEWPORT_DIM,
-        )
-      ) {
-        response.statusCode = 400;
-        response.end(
-          `Viewport dimensions must be between ${MIN_VIEWPORT_DIM} and ${MAX_VIEWPORT_DIM} pixels`,
-        );
-        return;
-      }
-
-      let einkColors = parseInt(requestUrl.searchParams.get("eink"));
-      if (isNaN(einkColors) || einkColors < 2) {
-        einkColors = undefined;
-      }
-
-      // Supported colours as hex: colors=FF0000,00FF00,0000FF,... or colors=#FF0000,#00FF00,#0000FF,...
-      // Use device config as default if available
-      const colorsQuery = requestUrl.searchParams.get("colors");
-      const colorsString = colorsQuery !== null ? colorsQuery : (deviceConfig?.colors || "");
-      let colors = colorsString
-        .split(",")
-        .map((color) => color.trim())
-        .map((color) => color.startsWith("#") ? color : `#${color}`)
-        .filter((color) => /^#[0-9A-F]{6}$/i.test(color));
-
-      // Palette colours for quantization (pixels matched to these, then mapped to colors)
-      // Use device config as default if available
-      const paletteColorsQuery = requestUrl.searchParams.get("palette_colors");
-      const paletteColorsString = paletteColorsQuery !== null ? paletteColorsQuery : (deviceConfig?.palette_colors || "");
-      let paletteColors = paletteColorsString
-        .split(",")
-        .map((color) => color.trim())
-        .map((color) => color.startsWith("#") ? color : `#${color}`)
-        .filter((color) => /^#[0-9A-F]{6}$/i.test(color));
-
-      // Validate that colors and paletteColors have the same length if both are provided
-      if (colors.length > 0 && paletteColors.length > 0 && colors.length !== paletteColors.length) {
-        // Mismatch - clear paletteColors to ignore it
-        paletteColors = [];
-      }
-
-      // Handle eink parameter deprecation and mutual exclusivity with colors
-      if (einkColors !== undefined) {
-        console.warn('[DEPRECATED] The "eink" query parameter is deprecated. Please use "colors" instead. Example: colors=000000,FFFFFF for black and white.');
-
-        // Convert eink=2 to black and white colors for backward compatibility
-        if (einkColors === 2 && colors.length === 0) {
-          colors = ["#000000", "#FFFFFF"];
-          console.log('[eink migration] Converted eink=2 to colors=000000,FFFFFF');
-          einkColors = undefined;
-        } else if (colors.length > 0) {
-          // colors parameter takes precedence - ignore eink
-          console.warn('[eink ignored] Both "eink" and "colors" parameters provided. Using "colors" and ignoring "eink".');
-          einkColors = undefined;
-        } else {
-          // Other palette sizes are no longer supported; fail loudly instead
-          // of silently returning a full-color screenshot.
-          response.statusCode = 400;
-          response.end(
-            `The "eink=${einkColors}" parameter is no longer supported. Use "colors" with a comma-separated list of hex colors instead, e.g. colors=000000,555555,AAAAAA,FFFFFF`,
-          );
-          return;
-        }
-      }
-
-      // If palette_colors is empty, use colors as the palette
-      if (paletteColors.length === 0 && colors.length > 0) {
-        paletteColors = colors;
-      }
-
-      let zoom = parseFloat(requestUrl.searchParams.get("zoom"));
-      if (isNaN(zoom) || zoom <= 0 || zoom > MAX_ZOOM) {
-        zoom = 1;
-      }
-
-      const invert = requestUrl.searchParams.has("invert");
-
-      let format = requestUrl.searchParams.get("format") || "png";
-      if (!["png", "jpeg", "webp", "bmp"].includes(format)) {
-        format = "png";
-      }
-
-      let pngMode = requestUrl.searchParams.get("png_mode") || "color";
-      if (!["color", "grayscale"].includes(pngMode)) {
-        pngMode = "color";
-      }
-
-      // BMP mode: 'color' (24-bit), 'grayscale' (8-bit), 'binary' (1-bit)
-      let bmpMode = requestUrl.searchParams.get("bmp_mode") || "color";
-      if (!["color", "grayscale", "binary"].includes(bmpMode)) {
-        bmpMode = "color";
-      }
-
-      let rotate = parseInt(requestUrl.searchParams.get("rotate"));
-      if (isNaN(rotate) || ![90, 180, 270].includes(rotate)) {
-        rotate = undefined;
-      }
-
-      const lang = requestUrl.searchParams.get("lang") || undefined;
-      const theme = requestUrl.searchParams.get("theme") || undefined;
-      // undefined means "not requested": when neither dark nor theme is given
-      const dark = requestUrl.searchParams.has("dark") ? true : undefined;
-
-      // Dithering algorithm
-      // Use device config as default if available
-      const ditheringQuery = requestUrl.searchParams.get("dithering");
-      let dithering = ditheringQuery !== null ? ditheringQuery : (deviceConfig?.dithering || "none");
-      const validDitheringAlgorithms = [
-        "none",
-        "floyd-steinberg",
-        "atkinson",
-        "jarvis-judice-ninke",
-        "stucki",
-        "burkes",
-        "sierra",
-        "sierra-lite"
-      ];
-      if (!validDitheringAlgorithms.includes(dithering)) {
-        dithering = "none";
-      }
-
-      const requestParams = {
-        pagePath: requestUrl.pathname,
-        viewport: { width: viewportParams[0], height: viewportParams[1] },
-        extraWait,
-        colors,
-        paletteColors,
-        dithering,
-        invert,
-        autoHeight,
-        zoom,
-        format,
-        pngMode,
-        bmpMode,
-        rotate,
-        lang,
-        theme,
-        dark,
-      };
 
       // Extract next param and schedule if necessary
       const nextParam = requestUrl.searchParams.get("next");
@@ -342,21 +368,8 @@ class RequestHandler {
         throw err;
       }
 
-      // If eink processing happened, the format could be png or bmp
-      const responseFormat = format;
-      let contentType;
-      if (responseFormat === "jpeg") {
-        contentType = "image/jpeg";
-      } else if (responseFormat === "webp") {
-        contentType = "image/webp";
-      } else if (responseFormat === "bmp") {
-        contentType = "image/bmp";
-      } else {
-        contentType = "image/png";
-      }
-
       response.writeHead(200, {
-        "Content-Type": contentType,
+        "Content-Type": screenshotContentType(requestParams.format),
         "Content-Length": image.length,
       });
       response.write(image);
@@ -429,16 +442,64 @@ class RequestHandler {
   }
 }
 
-const browser = new Browser(hassUrl, hassToken);
-const requestHandler = new RequestHandler(browser);
-const port = 10000;
-const server = http.createServer((request, response) =>
-  requestHandler.handleRequest(request, response),
-);
-server.listen(port);
-installShutdownHandlers(server, browser);
-const now = new Date();
-const serverUrl = isAddOn
-  ? `http://homeassistant.local:${port}`
-  : `http://localhost:${port}`;
-console.log(`[${now.toLocaleTimeString()}] Visit server at ${serverUrl}`);
+function createPushScreenshot(browser, { pathname, sourceUrl }) {
+  const params = parseScreenshotRequest(sourceUrl);
+  const dashboardOrigin = new URL(browser.homeAssistantUrl).origin;
+  const cache = new PushCapture({
+    contentType: screenshotContentType(params.format),
+    async open(push, close) {
+      await browser.cleanup();
+      await browser.navigatePage(params, {
+        requireReady: true,
+        async configurePage(page) {
+          const chromium = page.browser();
+          const pageLost = () => {
+            page.off("close", pageLost);
+            page.off("error", pageLost);
+            chromium.off("disconnected", pageLost);
+            close();
+          };
+          page.once("close", pageLost);
+          page.once("error", pageLost);
+          chromium.once("disconnected", pageLost);
+          await page.exposeFunction("puppetRefreshScreenshot", () => {
+            if (new URL(page.url()).origin === dashboardOrigin) push();
+          });
+        },
+      });
+    },
+    async capture() {
+      const { image } = await browser.screenshotPage(params);
+      return image;
+    },
+  });
+  return { pathname, cache };
+}
+
+function startServer() {
+  const browser = new Browser(hassUrl, hassToken);
+  const push = pushScreenshot && createPushScreenshot(browser, pushScreenshot);
+  const requestHandler = new RequestHandler(browser, { push });
+  const port = 10000;
+  const server = http.createServer((request, response) =>
+    requestHandler.handleRequest(request, response),
+  );
+  server.listen(port, () => {
+    void push?.cache.start();
+  });
+  installShutdownHandlers(server, {
+    cleanup(options) {
+      push?.cache.stop();
+      return browser.cleanup(options);
+    },
+  });
+  const now = new Date();
+  const serverUrl = isAddOn
+    ? `http://homeassistant.local:${port}`
+    : `http://localhost:${port}`;
+  console.log(`[${now.toLocaleTimeString()}] Visit server at ${serverUrl}`);
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  startServer();
+}
