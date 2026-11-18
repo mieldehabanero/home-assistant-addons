@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.7.0
+
+### Push-only screenshots
+
+- Enable push mode with `keep_browser_open` and a configured dashboard URL. Puppet captures when the dashboard opens or reopens, and dashboard code can request a refresh.
+- Serve the last successful image from a cached endpoint. GET requests capture only when the cache is empty, and a matching ETag returns `304 Not Modified`.
+- Ignore `next` in push mode. Normal mode continues capturing on demand and supports scheduled preloads.
+
 ## 2.6.5
 
 ### Bug fixes
