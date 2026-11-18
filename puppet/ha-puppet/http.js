@@ -1,4 +1,5 @@
 import http from "node:http";
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { Browser } from "./screenshot.js";
@@ -7,7 +8,6 @@ import { CannotOpenPageError } from "./error.js";
 import { handleUIRequest } from "./ui.js";
 import { loadDevicesConfig, getDeviceConfig } from "./devices.js";
 import { installShutdownHandlers } from "./shutdown.js";
-import { PushCapture } from "./push-capture.js";
 
 // Maximum number of next requests to keep in memory
 const MAX_NEXT_REQUESTS = 100;
@@ -35,12 +35,25 @@ function screenshotContentType(format) {
 }
 
 export class RequestHandler {
-  constructor(browser, { push } = {}) {
+  constructor(browser, { push, logger = console } = {}) {
     this.browser = browser;
-    this.push = push;
+    this.logger = logger;
+    if (push) {
+      const { pathname, sourceUrl, settleMs = 250, reopenMs = 1000 } = push;
+      const { requestParams, error } = RequestHandler.parseScreenshotRequest(sourceUrl);
+      if (error) throw error;
+      this.push = {
+        pathname,
+        requestParams,
+        origin: new URL(browser.homeAssistantUrl).origin,
+        settleMs,
+        reopenMs,
+      };
+      this.pushPageGeneration = 0;
+    }
     this.busy = false;
 
-    // Pending web requests
+    // Pending browser tasks
     this.pending = [];
 
     // Request counter to identify requests
@@ -119,7 +132,7 @@ export class RequestHandler {
         response.writeHead(405, { Allow: "GET" });
         response.end();
       } else {
-        await this.push.cache.serve(request, response);
+        await this.servePushScreenshot(request, response);
       }
       return;
     }
@@ -324,13 +337,6 @@ export class RequestHandler {
     console.debug(requestId, "Request", request.url);
 
     const start = new Date();
-    if (this.busy) {
-      console.log(requestId, "Busy, waiting in queue");
-      await new Promise((resolve) => this.pending.push(resolve));
-      const end = Date.now();
-      console.log(requestId, `Wait time: ${end - start} ms`);
-    }
-    this.busy = true;
 
     try {
       console.debug(requestId, "Handling", request.url);
@@ -352,16 +358,7 @@ export class RequestHandler {
 
       let image;
       try {
-        const navigateResult = await this.browser.navigatePage(requestParams);
-        console.debug(requestId, `Navigated in ${navigateResult.time} ms`);
-        this.navigationTime = Math.max(
-          this.navigationTime,
-          navigateResult.time,
-        );
-        const screenshotResult =
-          await this.browser.screenshotPage(requestParams);
-        console.debug(requestId, `Screenshot in ${screenshotResult.time} ms`);
-        image = screenshotResult.image;
+        image = await this.requestScreenshot({ requestParams, requestId });
       } catch (err) {
         if (err instanceof CannotOpenPageError) {
           console.error(requestId, `Cannot open page: ${err.message}`);
@@ -418,13 +415,170 @@ export class RequestHandler {
         clearTimeout(this.nextRequests.shift());
       }
     } finally {
-      this.busy = false;
-      const resolve = this.pending.shift();
-      if (resolve) {
-        resolve();
-      }
       this._markBrowserAccessed();
     }
+  }
+
+  async runBrowserTask(task) {
+    if (this.busy) {
+      await new Promise((resolve) => this.pending.push(resolve));
+    } else {
+      this.busy = true;
+    }
+
+    try {
+      return await task();
+    } finally {
+      const next = this.pending.shift();
+      // Keep the browser reserved while the next task resumes.
+      if (next) next();
+      else this.busy = false;
+    }
+  }
+
+  requestScreenshot({
+    requestParams = this.push?.requestParams,
+    requestId,
+    refresh = false,
+  } = {}) {
+    if (this.push) {
+      if (this.pushStopped || (!refresh && this.cachedScreenshot)) {
+        return Promise.resolve(this.cachedScreenshot);
+      }
+      if (this.pushCapture) {
+        if (refresh) this.pushRefreshPending = true;
+        return this.pushCapture;
+      }
+      clearTimeout(this.pushTimer);
+      this.pushTimer = undefined;
+    }
+
+    const capture = this.runBrowserTask(() => this.captureScreenshot(requestParams, requestId));
+    if (!this.push) return capture;
+
+    this.pushCapture = capture
+      .catch((error) => {
+        if (!this.pushStopped) this.logger.error("Push screenshot capture failed:", error);
+      })
+      .finally(() => {
+        this.pushCapture = undefined;
+        if (this.pushRefreshPending) {
+          this.pushRefreshPending = false;
+          this.schedulePushCapture(this.push.settleMs);
+        }
+      });
+    return this.pushCapture;
+  }
+
+  async captureScreenshot(requestParams, requestId) {
+    const generation = this.pushPageGeneration;
+    if (this.push) {
+      if (!this.pushPageReady) await this.openPushPage(requestParams, generation);
+      if (!this.isCurrentPushPage(generation)) return;
+    } else {
+      const { time } = await this.browser.navigatePage(requestParams);
+      console.debug(requestId, `Navigated in ${time} ms`);
+      this.navigationTime = Math.max(this.navigationTime, time);
+    }
+
+    const { image, time } = await this.browser.screenshotPage(requestParams);
+    if (!this.push) {
+      console.debug(requestId, `Screenshot in ${time} ms`);
+      return image;
+    }
+
+    if (this.isCurrentPushPage(generation)) {
+      const etag = `"${createHash("sha256").update(image).digest("hex")}"`;
+      this.cachedScreenshot = { image, etag };
+    }
+    return this.cachedScreenshot;
+  }
+
+  isCurrentPushPage(generation) {
+    // A closed page can still have a capture or a dashboard callback in flight.
+    return !this.pushStopped && generation === this.pushPageGeneration;
+  }
+
+  schedulePushCapture(delay) {
+    if (this.pushStopped || this.pushTimer !== undefined) return;
+    this.pushTimer = setTimeout(() => {
+      this.pushTimer = undefined;
+      void this.requestScreenshot({ refresh: true });
+    }, delay);
+  }
+
+  async openPushPage(requestParams, generation) {
+    const onClose = () => {
+      if (!this.isCurrentPushPage(generation)) return;
+      this.pushPageGeneration++;
+      this.pushPageReady = false;
+      this.schedulePushCapture(this.push.reopenMs);
+    };
+
+    try {
+      await this.browser.cleanup();
+      await this.browser.navigatePage(requestParams, {
+        requireReady: true,
+        configurePage: async (page) => {
+          const chromium = page.browser();
+          const pageLost = () => {
+            page.off("close", pageLost);
+            page.off("error", pageLost);
+            chromium.off("disconnected", pageLost);
+            onClose();
+          };
+          page.once("close", pageLost);
+          page.once("error", pageLost);
+          chromium.once("disconnected", pageLost);
+          await page.exposeFunction("puppetRefreshScreenshot", () => {
+            if (
+              this.isCurrentPushPage(generation) &&
+              new URL(page.url()).origin === this.push.origin
+            ) {
+              this.schedulePushCapture(this.push.settleMs);
+            }
+          });
+        },
+      });
+      if (this.isCurrentPushPage(generation)) this.pushPageReady = true;
+    } catch (error) {
+      onClose();
+      throw error;
+    }
+  }
+
+  stopPushCapture() {
+    this.pushStopped = true;
+    clearTimeout(this.pushTimer);
+    this.pushTimer = undefined;
+  }
+
+  async servePushScreenshot(request, response) {
+    const cached = await this.requestScreenshot();
+    if (!cached) {
+      response.writeHead(503, { "Cache-Control": "no-store" });
+      response.end("Screenshot unavailable");
+      return;
+    }
+
+    const { image, etag } = cached;
+    const headers = { ETag: etag, "Cache-Control": "private, no-cache" };
+    const validator = request.headers["if-none-match"];
+    const matches = validator?.trim() === "*" || validator?.split(",").some(
+      (tag) => tag.trim().replace(/^W\//, "") === etag,
+    );
+    if (matches) {
+      response.writeHead(304, headers);
+      response.end();
+      return;
+    }
+
+    response.writeHead(200, {
+      ...headers,
+      "Content-Type": screenshotContentType(this.push.requestParams.format),
+      "Content-Length": image.length,
+    });
+    response.end(image);
   }
 
   async prepareNextRequest(requestId, requestParams) {
@@ -433,73 +587,31 @@ export class RequestHandler {
       return;
     }
     requestId = `${requestId}-next`;
-    this.busy = true;
     console.log(requestId, "Preparing next request");
     try {
-      const navigateResult = await this.browser.navigatePage(requestParams);
-      console.debug(requestId, `Navigated in ${navigateResult.time} ms`);
+      const { time } = await this.runBrowserTask(() => this.browser.navigatePage(requestParams));
+      console.debug(requestId, `Navigated in ${time} ms`);
     } catch (err) {
       console.error(requestId, "Error preparing next request", err);
     } finally {
-      this.busy = false;
-      const resolve = this.pending.shift();
-      if (resolve) {
-        resolve();
-      }
       this._markBrowserAccessed();
     }
   }
 }
 
-function createPushScreenshot(browser, { pathname, sourceUrl }) {
-  const { requestParams: params, error } = RequestHandler.parseScreenshotRequest(sourceUrl);
-  if (error) throw error;
-  const dashboardOrigin = new URL(browser.homeAssistantUrl).origin;
-  const cache = new PushCapture({
-    contentType: screenshotContentType(params.format),
-    async open(push, close) {
-      await browser.cleanup();
-      await browser.navigatePage(params, {
-        requireReady: true,
-        async configurePage(page) {
-          const chromium = page.browser();
-          const pageLost = () => {
-            page.off("close", pageLost);
-            page.off("error", pageLost);
-            chromium.off("disconnected", pageLost);
-            close();
-          };
-          page.once("close", pageLost);
-          page.once("error", pageLost);
-          chromium.once("disconnected", pageLost);
-          await page.exposeFunction("puppetRefreshScreenshot", () => {
-            if (new URL(page.url()).origin === dashboardOrigin) push();
-          });
-        },
-      });
-    },
-    async capture() {
-      const { image } = await browser.screenshotPage(params);
-      return image;
-    },
-  });
-  return { pathname, cache };
-}
-
 function startServer() {
   const browser = new Browser(hassUrl, hassToken);
-  const push = pushScreenshot && createPushScreenshot(browser, pushScreenshot);
-  const requestHandler = new RequestHandler(browser, { push });
+  const requestHandler = new RequestHandler(browser, { push: pushScreenshot });
   const port = 10000;
   const server = http.createServer((request, response) =>
     requestHandler.handleRequest(request, response),
   );
   server.listen(port, () => {
-    void push?.cache.start();
+    if (pushScreenshot) void requestHandler.requestScreenshot({ refresh: true });
   });
   installShutdownHandlers(server, {
     cleanup(options) {
-      push?.cache.stop();
+      requestHandler.stopPushCapture();
       return browser.cleanup(options);
     },
   });
