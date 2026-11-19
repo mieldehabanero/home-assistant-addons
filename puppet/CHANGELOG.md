@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.7.2
+
+### Bug fixes
+
+- Shorten push screenshot ETags so displays with a 63-byte limit can receive `304 Not Modified` for unchanged images.
+
 ## 2.7.1
 
 ### Push-only screenshots
