@@ -524,7 +524,7 @@ export class RequestHandler {
     }
 
     if (this.isCurrentPushPage(generation)) {
-      const etag = `"${createHash("sha256").update(image).digest("hex")}"`;
+      const etag = `"${createHash("sha256").update(image).digest("base64url")}"`;
       this.cachedScreenshot = { image, etag };
     }
     return this.cachedScreenshot;
